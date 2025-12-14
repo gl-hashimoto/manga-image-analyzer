@@ -7,25 +7,24 @@ import base64
 from io import BytesIO
 from PIL import Image
 import re
-from pathlib import Path
-
-# .envファイルのパス
-ENV_FILE = Path(__file__).parent / ".env"
 
 
-def load_api_key() -> str:
-    """保存されたAPIキーを読み込む"""
-    if ENV_FILE.exists():
-        content = ENV_FILE.read_text()
-        for line in content.split("\n"):
-            if line.startswith("ANTHROPIC_API_KEY="):
-                return line.split("=", 1)[1].strip()
-    return ""
+def get_api_key_from_secrets() -> str:
+    """Streamlit SecretsからAPIキーを取得"""
+    try:
+        return st.secrets.get("ANTHROPIC_API_KEY", "")
+    except Exception:
+        return ""
 
 
-def save_api_key(api_key: str):
-    """APIキーを.envファイルに保存"""
-    ENV_FILE.write_text(f"ANTHROPIC_API_KEY={api_key}\n")
+def get_stored_api_key() -> str:
+    """セッションまたはSecretsからAPIキーを取得"""
+    # まずSecretsをチェック（管理者設定）
+    secrets_key = get_api_key_from_secrets()
+    if secrets_key:
+        return secrets_key
+    # 次にセッション状態をチェック（ユーザー入力）
+    return st.session_state.get("user_api_key", "")
 
 
 st.set_page_config(
@@ -474,30 +473,38 @@ def check_title_consistency(title: str, summary: str, api_key: str) -> str:
 with st.sidebar:
     st.header("⚙️ 設定")
 
-    saved_api_key = load_api_key()
+    # SecretsにAPIキーがあるかチェック
+    secrets_key = get_api_key_from_secrets()
 
-    api_key = st.text_input(
-        "Anthropic API Key",
-        type="password",
-        value=saved_api_key,
-        help="Claude APIキーを入力してください"
-    )
+    if secrets_key:
+        # Secretsに設定済みの場合
+        st.success("APIキー設定済み（管理者）")
+        api_key = secrets_key
+    else:
+        # ユーザー入力モード
+        api_key_input = st.text_input(
+            "Anthropic API Key",
+            type="password",
+            value=st.session_state.get("user_api_key", ""),
+            help="Claude APIキーを入力してください",
+            key="api_key_input"
+        )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("💾 保存", use_container_width=True):
-            if api_key:
-                save_api_key(api_key)
-                st.success("保存しました")
+        if st.button("🔐 APIキーを設定", use_container_width=True):
+            if api_key_input:
+                st.session_state["user_api_key"] = api_key_input
+                st.success("セッションに保存しました")
+                st.rerun()
             else:
                 st.warning("APIキーを入力してください")
 
-    with col2:
-        if st.button("🗑️ 削除", use_container_width=True):
-            if ENV_FILE.exists():
-                ENV_FILE.unlink()
-                st.success("削除しました")
+        if st.session_state.get("user_api_key"):
+            st.info("APIキー設定済み（セッション）")
+            if st.button("🗑️ クリア", use_container_width=True):
+                del st.session_state["user_api_key"]
                 st.rerun()
+
+        api_key = st.session_state.get("user_api_key", "")
 
     st.divider()
 
