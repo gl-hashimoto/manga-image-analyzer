@@ -10,6 +10,10 @@ import re
 import os
 import json
 import hashlib
+import zipfile
+from datetime import datetime
+import threading
+import concurrent.futures
 from typing import Any
 from dotenv import load_dotenv
 
@@ -17,6 +21,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 ANTHROPIC_VERSION = "2023-06-01"
+
+_LLM_CACHE_LOCK = threading.Lock()
 
 
 def get_api_key_from_env() -> str:
@@ -96,6 +102,91 @@ def _extract_json_block(text: str) -> str | None:
         return None
     return text[start : end + 1]
 
+
+def _get_output_base_dir() -> str:
+    """アーカイブ保存先（リポジトリ内 output/）"""
+    try:
+        base = os.path.dirname(__file__)
+    except Exception:
+        base = os.getcwd()
+    return os.path.join(base, "output")
+
+
+def _ensure_output_dir() -> str:
+    base = _get_output_base_dir()
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def _make_run_id() -> str:
+    # 例: 20251216_235959_ab12cd34
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    rnd = hashlib.sha256(os.urandom(16)).hexdigest()[:8]
+    return f"{ts}_{rnd}"
+
+
+def _safe_write_text(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _safe_write_json(path: str, obj: Any) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def _zip_dir_to_bytes(dir_path: str) -> bytes:
+    """ディレクトリをZIP化してbytesで返す（download_button用）"""
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(dir_path):
+            for name in files:
+                full = os.path.join(root, name)
+                rel = os.path.relpath(full, dir_path)
+                zf.write(full, rel)
+    return buf.getvalue()
+
+
+def save_archive_run(
+    summary_md: str,
+    meta: dict[str, Any],
+    config: dict[str, Any],
+    panel_details_text: str | None = None,
+) -> tuple[str | None, str | None]:
+    """解析結果をoutput/に保存してアーカイブ化。戻り値は(run_dir, run_id)"""
+    try:
+        base = _ensure_output_dir()
+        run_id = _make_run_id()
+        run_dir = os.path.join(base, run_id)
+        os.makedirs(run_dir, exist_ok=True)
+
+        _safe_write_text(os.path.join(run_dir, "summary.md"), summary_md)
+        _safe_write_json(os.path.join(run_dir, "meta.json"), meta)
+        _safe_write_json(os.path.join(run_dir, "config.json"), config)
+        if panel_details_text:
+            _safe_write_text(os.path.join(run_dir, "panel_details.txt"), panel_details_text)
+
+        return run_dir, run_id
+    except Exception as e:
+        return None, None
+
+
+def list_archives(limit: int = 30) -> list[str]:
+    """保存済みアーカイブディレクトリ(run_id)の一覧"""
+    base = _ensure_output_dir()
+    try:
+        items = []
+        for name in os.listdir(base):
+            p = os.path.join(base, name)
+            if os.path.isdir(p):
+                items.append(name)
+        # run_idは先頭が日時なので降順でOK
+        items.sort(reverse=True)
+        return items[:limit]
+    except Exception:
+        return []
 
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def _cached_download_image(url: str, referer: str = "") -> bytes | None:
@@ -210,6 +301,41 @@ def get_available_anthropic_models(api_key: str) -> list[str]:
         return models
     except Exception:
         return []
+
+
+def resolve_fixed_models(available_models: list[str]) -> dict[str, str]:
+    """利用可能モデル一覧から、役割ごとの固定モデルを自動選択する。
+
+    方針（ユーザー要望）:
+    - 抽出（一次）: Sonnet系
+    - 抽出（再抽出）: Opus
+    - テキスト検証: Haiku系
+    - 要約: Haiku系
+    - タイトル整合性: Haiku系
+
+    available_modelsが空/該当なしの場合は、Opus固定名へフォールバック（404回避は保証できない）。
+    """
+    fallback_opus = "claude-opus-4-5-20251101"
+
+    def pick(keyword: str, default: str) -> str:
+        # 例: "sonnet" を含むモデルIDを探し、"latest" を優先して選ぶ
+        cands = [m for m in (available_models or []) if keyword.lower() in m.lower()]
+        if not cands:
+            return default
+        cands.sort(key=lambda s: (0 if "latest" in s else 1, s), reverse=False)
+        return cands[0]
+
+    primary = pick("sonnet", fallback_opus)
+    fallback = pick("opus", fallback_opus)
+    haiku = pick("haiku", fallback_opus)
+
+    return {
+        "primary_model": primary,
+        "fallback_model": fallback,
+        "verifier_model": haiku,
+        "summary_model": haiku,
+        "consistency_model": haiku,
+    }
 
 
 def get_request_headers(url: str) -> dict:
@@ -380,32 +506,50 @@ def get_page_images(url: str, debug: bool = False) -> tuple[list[dict], Beautifu
             img.get("data-lazy-src") or
             img.get("data-original") or
             img.get("data-full-url") or
-            img.get("srcset", "").split()[0] if img.get("srcset") else None
+            img.get("data-lazy") or
+            img.get("data-image") or
+            (img.get("srcset", "").split()[0] if img.get("srcset") else None)
         )
 
         if not src:
+            if debug:
+                st.write(f"⚠️ src無し: {str(img)[:100]}...")
             continue
 
         if src.startswith("data:"):
+            if debug:
+                st.write(f"⚠️ data URI スキップ")
             continue
 
         img_url = urljoin(url, src)
 
-        img_extensions = [".jpg", ".jpeg", ".png", ".gif", ".webp"]
+        img_extensions = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif"]
         has_img_ext = any(ext in img_url.lower() for ext in img_extensions)
 
         if any(pattern in img_url.lower() for pattern in skip_patterns):
+            if debug:
+                st.write(f"⚠️ スキップパターン: {img_url[:80]}...")
             continue
 
         alt_text = img.get("alt", "")
 
-        if has_img_ext or "/uploads/" in img_url or "/images/" in img_url:
+        # 条件を緩和: /wp-content/ や クエリ付きURLも許容
+        img_path_patterns = ["/uploads/", "/images/", "/wp-content/", "/img/", "/photo/", "/manga/", "/comic/"]
+        has_img_path = any(p in img_url.lower() for p in img_path_patterns)
+        
+        # さらに緩和: URLにサイズ指定っぽいパラメータがあれば画像とみなす
+        has_size_param = any(x in img_url.lower() for x in ["width=", "height=", "w=", "h=", "size=", "resize"])
+
+        if has_img_ext or has_img_path or has_size_param:
             images.append({
                 "url": img_url,
                 "alt": alt_text
             })
             if debug:
-                st.write(f"画像追加: {img_url[:80]}...")
+                st.write(f"✅ 画像追加: {img_url[:80]}...")
+        else:
+            if debug:
+                st.write(f"❌ 条件不一致でスキップ: {img_url[:80]}...")
 
     # 重複を除去
     seen_urls = set()
@@ -671,9 +815,10 @@ def encode_image_to_base64(img_info: dict) -> tuple[str, str]:
 
 def _get_llm_cache() -> dict:
     """セッション内キャッシュ（同一画像×同一モデルの再課金を抑止）"""
-    if "llm_cache" not in st.session_state:
-        st.session_state["llm_cache"] = {}
-    return st.session_state["llm_cache"]
+    with _LLM_CACHE_LOCK:
+        if "llm_cache" not in st.session_state:
+            st.session_state["llm_cache"] = {}
+        return st.session_state["llm_cache"]
 
 
 def _image_cache_key(img_info: dict, model: str, prompt_key: str) -> str:
@@ -748,8 +893,9 @@ def extract_image_facts_single(
     """画像1枚から“人物・関係性・主要イベント”を構造化抽出（大筋あらすじ用途）"""
     cache = _get_llm_cache()
     cache_key = _image_cache_key(img_info, model=model, prompt_key="facts_v1")
-    if cache_key in cache:
-        return cache[cache_key]
+    with _LLM_CACHE_LOCK:
+        if cache_key in cache:
+            return cache[cache_key]
 
     base64_image, media_type = encode_image_to_base64(img_info)
     header = ""
@@ -794,7 +940,8 @@ def extract_image_facts_single(
             temperature=0.2,
         )
     except Exception:
-        cache[cache_key] = None
+        with _LLM_CACHE_LOCK:
+            cache[cache_key] = None
         return None
 
     json_block = _extract_json_block(text) or text
@@ -805,10 +952,12 @@ def extract_image_facts_single(
         facts.setdefault("page", page)
         facts["_usage"] = usage
         facts["_model"] = model
-        cache[cache_key] = facts
+        with _LLM_CACHE_LOCK:
+            cache[cache_key] = facts
         return facts
 
-    cache[cache_key] = None
+    with _LLM_CACHE_LOCK:
+        cache[cache_key] = None
     return None
 
 
@@ -822,6 +971,8 @@ def extract_panel_details(
     suspicious_confidence_threshold: float = 0.55,
     enable_text_verifier: bool = True,
     verifier_model: str = "claude-haiku-4-5-20251101",
+    concurrency_primary: int = 1,
+    concurrency_fallback: int = 1,
     debug: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """Step1: 画像→事実抽出（安価モデル中心、怪しい画像だけOpusへ）
@@ -835,18 +986,39 @@ def extract_panel_details(
     suspicious_reasons: dict[int, list[str]] = {}
     meta: dict[str, Any] = {"usage_totals": {}}
 
-    for idx, img_info in enumerate(images):
-        facts = extract_image_facts_single(
-            img_info=img_info,
+    extracted = [None] * len(images)
+
+    def _run_primary(i: int, info: dict) -> tuple[int, dict[str, Any] | None]:
+        f = extract_image_facts_single(
+            img_info=info,
             api_key=api_key,
             model=primary_model,
             title=title,
             max_tokens=max_tokens_per_image,
         )
+        return i, f
+
+    # 一次抽出は並列化（壁時計時間短縮）
+    concurrency_primary = max(1, int(concurrency_primary))
+    if concurrency_primary == 1:
+        for idx, img_info in enumerate(images):
+            i, f = _run_primary(idx, img_info)
+            extracted[i] = f
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency_primary) as ex:
+            futures = [ex.submit(_run_primary, idx, img_info) for idx, img_info in enumerate(images)]
+            for fut in concurrent.futures.as_completed(futures):
+                i, f = fut.result()
+                extracted[i] = f
+
+    # 結果の整形＋怪しさ判定
+    normalized: list[dict[str, Any]] = []
+    for idx, img_info in enumerate(images):
+        facts = extracted[idx]
         if facts is None:
             suspicious_indices.append(idx)
             suspicious_reasons[idx] = ["抽出失敗(None)"]
-            extracted.append({
+            fallback = {
                 "episode": img_info.get("episode", 1),
                 "page": img_info.get("page", 1),
                 "characters": [],
@@ -854,7 +1026,8 @@ def extract_panel_details(
                 "key_dialogue_quotes": [],
                 "confidence": 0.0,
                 "uncertainties": ["抽出失敗"],
-            })
+            }
+            normalized.append(fallback)
             continue
 
         # しきい値判定
@@ -867,13 +1040,13 @@ def extract_panel_details(
             suspicious_indices.append(idx)
             suspicious_reasons[idx] = reasons
 
-        extracted.append(facts)
+        normalized.append(facts)
         _add_usage_totals(meta, facts.get("_model", ""), facts.get("_usage"))
 
     # 追加の検証（テキストのみ、安価モデル）: “怪しい画像候補”を増やす
-    if enable_text_verifier and extracted:
+    if enable_text_verifier and normalized:
         try:
-            payload = json.dumps(extracted, ensure_ascii=False)
+            payload = json.dumps(normalized, ensure_ascii=False)
             verifier_content = [
                 {
                     "type": "text",
@@ -911,26 +1084,41 @@ def extract_panel_details(
     # 怪しい画像だけOpusへ再抽出（上書き）
     escalated = 0
     if fallback_model and fallback_model != primary_model:
-        for idx in suspicious_indices:
-            img_info = images[idx]
-            facts_opus = extract_image_facts_single(
-                img_info=img_info,
+        concurrency_fallback = max(1, int(concurrency_fallback))
+
+        def _run_fallback(i: int, info: dict) -> tuple[int, dict[str, Any] | None]:
+            f = extract_image_facts_single(
+                img_info=info,
                 api_key=api_key,
                 model=fallback_model,
                 title=title,
                 max_tokens=max_tokens_per_image,
             )
-            if facts_opus is not None:
-                extracted[idx] = facts_opus
-                _add_usage_totals(meta, facts_opus.get("_model", ""), facts_opus.get("_usage"))
-                escalated += 1
+            return i, f
+
+        if concurrency_fallback == 1:
+            for idx in suspicious_indices:
+                i, f = _run_fallback(idx, images[idx])
+                if f is not None:
+                    normalized[i] = f
+                    _add_usage_totals(meta, f.get("_model", ""), f.get("_usage"))
+                    escalated += 1
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency_fallback) as ex:
+                futures = [ex.submit(_run_fallback, idx, images[idx]) for idx in suspicious_indices]
+                for fut in concurrent.futures.as_completed(futures):
+                    i, f = fut.result()
+                    if f is not None:
+                        normalized[i] = f
+                        _add_usage_totals(meta, f.get("_model", ""), f.get("_usage"))
+                        escalated += 1
 
     # Step2へ渡す“材料”をテキスト化（JSONでもよいが、ここは見やすさ優先）
     lines: list[str] = []
     if title:
         lines.append(f"【参考タイトル】{title}")
     lines.append("【画像ごとの抽出（人物/イベント中心）】")
-    for i, facts in enumerate(extracted, start=1):
+    for i, facts in enumerate(normalized, start=1):
         ep = facts.get("episode", 1)
         page = facts.get("page", 1)
         chars = facts.get("characters", [])
@@ -1018,6 +1206,8 @@ def analyze_images_batch(
     max_tokens_per_image: int = 700,
     suspicious_confidence_threshold: float = 0.55,
     enable_text_verifier: bool = True,
+    concurrency_primary: int = 1,
+    concurrency_fallback: int = 1,
     debug: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     """2段階解析: セリフ抽出→ストーリーまとめ"""
@@ -1033,6 +1223,8 @@ def analyze_images_batch(
         suspicious_confidence_threshold=suspicious_confidence_threshold,
         enable_text_verifier=enable_text_verifier,
         verifier_model=verifier_model,
+        concurrency_primary=concurrency_primary,
+        concurrency_fallback=concurrency_fallback,
         debug=debug,
     )
 
@@ -1082,6 +1274,10 @@ def analyze_images_batch(
     # デバッグ用（長文は重いのでプレビューのみ）
     meta["summary_model"] = summary_model
     meta["panel_details_preview"] = panel_details[:4000]
+    meta["panel_details_full_len"] = len(panel_details)
+    meta["panel_details_full"] = panel_details
+    meta["concurrency_primary"] = concurrency_primary
+    meta["concurrency_fallback"] = concurrency_fallback
 
     return summary, meta
 
@@ -1222,76 +1418,26 @@ with st.sidebar:
 
     st.subheader("🤖 モデル設定")
     available_models = get_available_anthropic_models(api_key) if api_key else []
+    fixed = resolve_fixed_models(available_models)
     if available_models:
-        st.caption("✅ APIキーで利用可能なモデル一覧を取得しました（404を避けるため、ここから選ぶのがおすすめです）")
+        st.caption("✅ APIキーで利用可能なモデル一覧から、固定ルール（Sonnet/Opus/Haiku）に基づき自動選択しています。")
     else:
-        st.caption("ℹ️ 利用可能モデル一覧を取得できませんでした。モデル名は手入力してください（404が出る場合はモデル名が違います）。")
+        st.warning("⚠️ 利用可能モデル一覧を取得できませんでした。モデルは暫定でOpus固定名にフォールバックします（404が出る場合があります）。")
 
-    default_opus = "claude-opus-4-5-20251101"
+    primary_model = fixed["primary_model"]          # Sonnet系
+    fallback_model = fixed["fallback_model"]        # Opus
+    verifier_model = fixed["verifier_model"]        # Haiku系
+    summary_model = fixed["summary_model"]          # Haiku系
+    consistency_model = fixed["consistency_model"]  # Haiku系
 
-    if available_models:
-        primary_model = st.selectbox(
-            "抽出（一次）モデル",
-            options=available_models,
-            index=0 if default_opus not in available_models else available_models.index(default_opus),
-            help="画像→人物/イベント抽出の一次モデル（基本はここを安価に）"
-        )
-    else:
-        primary_model = st.text_input(
-            "抽出（一次）モデル",
-            value=default_opus,
-            help="画像→人物/イベント抽出の一次モデル（基本はここを安価に）"
-        )
-    enable_fallback_opus = st.checkbox("怪しい画像だけ高精度モデルへ再抽出（推奨）", value=True)
-    if available_models:
-        fallback_model = st.selectbox(
-            "抽出（再抽出）モデル",
-            options=available_models,
-            index=0 if default_opus not in available_models else available_models.index(default_opus),
-            help="一次抽出が怪しい時だけ使うモデル（Opusなど）"
-        )
-    else:
-        fallback_model = st.text_input(
-            "抽出（再抽出）モデル",
-            value=default_opus,
-            help="一次抽出が怪しい時だけ使うモデル（Opusなど）"
-        )
+    st.markdown("**モデルは固定です（変更不可）**")
+    st.write(f"- 抽出（一次）モデル: `{primary_model}`")
+    st.write(f"- 抽出（再抽出）モデル: `{fallback_model}`")
+    st.write(f"- テキスト検証モデル: `{verifier_model}`")
+    st.write(f"- 要約モデル: `{summary_model}`")
+    st.write(f"- タイトル整合性チェック: `{consistency_model}`")
 
-    if available_models:
-        summary_model = st.selectbox(
-            "要約モデル",
-            options=available_models,
-            index=0 if default_opus not in available_models else available_models.index(default_opus),
-            help="画像抽出後のテキスト要約なので、基本は安価モデルでOK（安いモデルが使えるなら切替推奨）"
-        )
-        verifier_model = st.selectbox(
-            "テキスト検証モデル（任意）",
-            options=available_models,
-            index=0 if default_opus not in available_models else available_models.index(default_opus),
-            help="抽出JSONの不足/矛盾をテキストだけで検知（安いモデル推奨）"
-        )
-        consistency_model = st.selectbox(
-            "タイトル整合性チェックモデル",
-            options=available_models,
-            index=0 if default_opus not in available_models else available_models.index(default_opus),
-            help="テキストのみのチェック。安いモデルで十分"
-        )
-    else:
-        summary_model = st.text_input(
-            "要約モデル",
-            value=default_opus,
-            help="画像抽出後のテキスト要約なので、基本は安価モデルでOK（安いモデルが使えるなら切替推奨）"
-        )
-        verifier_model = st.text_input(
-            "テキスト検証モデル（任意）",
-            value=default_opus,
-            help="抽出JSONの不足/矛盾をテキストだけで検知（安いモデル推奨）"
-        )
-        consistency_model = st.text_input(
-            "タイトル整合性チェックモデル",
-            value=default_opus,
-            help="テキストのみのチェック。安いモデルで十分"
-        )
+    enable_fallback_opus = st.checkbox("怪しい画像だけ再抽出（推奨）", value=True)
 
     st.subheader("🔎 検知パラメータ")
     max_tokens_per_image = st.slider(
@@ -1313,6 +1459,25 @@ with st.sidebar:
         "テキスト検証で“怪しい画像”候補を追加（推奨）",
         value=True,
         help="画像は見ず、抽出結果(JSON)だけを安価モデルでチェックします"
+    )
+
+    st.subheader("⚡ 速度（並列実行）")
+    st.caption("同時リクエスト数を増やすと速くなりますが、APIのレート制限/一時エラーが増える場合があります。まずは2〜4がおすすめです。")
+    concurrency_primary = st.slider(
+        "一次抽出の同時実行数",
+        min_value=1,
+        max_value=8,
+        value=2,
+        step=1,
+        help="画像→人物/イベント抽出（枚数分呼ぶ）の並列数"
+    )
+    concurrency_fallback = st.slider(
+        "再抽出（怪しい画像）の同時実行数",
+        min_value=1,
+        max_value=6,
+        value=2,
+        step=1,
+        help="怪しい画像だけ再抽出する部分の並列数"
     )
 
 # メインコンテンツ
@@ -1452,10 +1617,81 @@ if analyze_button:
                         max_tokens_per_image=max_tokens_per_image,
                         suspicious_confidence_threshold=suspicious_confidence_threshold,
                         enable_text_verifier=enable_text_verifier,
+                        concurrency_primary=concurrency_primary,
+                        concurrency_fallback=concurrency_fallback,
                         debug=debug_mode,
                     )
 
                 st.markdown(summary)
+
+                # アーカイブ保存（自動）
+                archive_config = {
+                    "url": url,
+                    "manga_type": manga_type_label,
+                    "num_episodes": num_episodes,
+                    "article_title": article_title,
+                    "filters": {
+                        "min_image_size_kb": min_image_size,
+                        "max_images_total": max_images_total,
+                    },
+                    "preprocess": {
+                        "max_side": preprocess_max_side,
+                        "jpeg_quality": preprocess_jpeg_quality,
+                    },
+                    "models": {
+                        "primary_model": primary_model,
+                        "fallback_model": used_fallback_model,
+                        "verifier_model": verifier_model,
+                        "summary_model": summary_model,
+                        "consistency_model": consistency_model,
+                    },
+                    "params": {
+                        "max_tokens_per_image": max_tokens_per_image,
+                        "suspicious_confidence_threshold": suspicious_confidence_threshold,
+                        "enable_text_verifier": enable_text_verifier,
+                        "concurrency_primary": concurrency_primary,
+                        "concurrency_fallback": concurrency_fallback,
+                    },
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                }
+                run_dir, run_id = save_archive_run(
+                    summary_md=summary,
+                    meta=meta,
+                    config=archive_config,
+                    panel_details_text=meta.get("panel_details_full"),
+                )
+                if run_dir and run_id:
+                    st.session_state["last_run_dir"] = run_dir
+                    st.session_state["last_run_id"] = run_id
+                    st.success(f"📦 解析結果をアーカイブしました: output/{run_id}/")
+                else:
+                    st.warning("⚠️ アーカイブ保存に失敗しました（書き込み権限/ディスク容量をご確認ください）")
+
+                # ダウンロード（現在の結果）
+                st.subheader("⬇️ ダウンロード")
+                st.download_button(
+                    "あらすじ（Markdown）をダウンロード",
+                    data=summary.encode("utf-8"),
+                    file_name=f"summary_{st.session_state.get('last_run_id','result')}.md",
+                    mime="text/markdown",
+                    use_container_width=True,
+                )
+                st.download_button(
+                    "解析メタ（JSON）をダウンロード",
+                    data=json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8"),
+                    file_name=f"meta_{st.session_state.get('last_run_id','result')}.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
+                if run_dir and run_id:
+                    zip_bytes = _zip_dir_to_bytes(run_dir)
+                    st.download_button(
+                        "アーカイブ（ZIP）をダウンロード",
+                        data=zip_bytes,
+                        file_name=f"archive_{run_id}.zip",
+                        mime="application/zip",
+                        use_container_width=True,
+                    )
 
                 with st.expander("🔧 解析メタ（コスト/品質の参考）", expanded=False):
                     st.write(f"総画像: {meta.get('total_images')} / 怪しい判定: {meta.get('suspicious_images')} / 再抽出: {meta.get('escalated_to_opus')}")
@@ -1514,3 +1750,71 @@ if analyze_button:
 # フッター
 st.divider()
 st.caption("💡 ヒント: 記事タイトルを入力すると、あらすじとの整合性を自動チェックします")
+
+st.divider()
+st.header("📦 アーカイブ")
+st.markdown("過去に生成した結果を一覧表示します。各アーカイブは `output/<run_id>/` に保存されます。")
+
+archive_limit = st.slider("表示するアーカイブ数", min_value=5, max_value=50, value=15, step=5)
+archives = list_archives(limit=archive_limit)
+if not archives:
+    st.info("まだアーカイブがありません。上の「解析開始」から生成すると自動で保存されます。")
+else:
+    for run_id in archives:
+        run_dir = os.path.join(_get_output_base_dir(), run_id)
+        summary_path = os.path.join(run_dir, "summary.md")
+        config_path = os.path.join(run_dir, "config.json")
+        meta_path = os.path.join(run_dir, "meta.json")
+
+        with st.expander(f"🗂️ {run_id}", expanded=False):
+            # 概要表示
+            try:
+                if os.path.exists(config_path):
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    st.write(f"URL: {cfg.get('url','')}")
+                    st.write(f"種別: {cfg.get('manga_type','')} / 話数: {cfg.get('num_episodes','')}")
+                    if cfg.get("article_title"):
+                        st.write(f"タイトル: {cfg.get('article_title')}")
+            except Exception:
+                pass
+
+            try:
+                if os.path.exists(summary_path):
+                    with open(summary_path, "r", encoding="utf-8") as f:
+                        s = f.read()
+                    st.text_area("summary.md", value=s[:3000], height=220)
+            except Exception:
+                st.caption("summary.md を読み込めませんでした。")
+
+            cols = st.columns(3)
+            with cols[0]:
+                if os.path.exists(summary_path):
+                    st.download_button(
+                        "Markdown",
+                        data=open(summary_path, "rb").read(),
+                        file_name=f"summary_{run_id}.md",
+                        mime="text/markdown",
+                        use_container_width=True,
+                    )
+            with cols[1]:
+                if os.path.exists(meta_path):
+                    st.download_button(
+                        "meta.json",
+                        data=open(meta_path, "rb").read(),
+                        file_name=f"meta_{run_id}.json",
+                        mime="application/json",
+                        use_container_width=True,
+                    )
+            with cols[2]:
+                try:
+                    zip_bytes = _zip_dir_to_bytes(run_dir)
+                    st.download_button(
+                        "ZIP",
+                        data=zip_bytes,
+                        file_name=f"archive_{run_id}.zip",
+                        mime="application/zip",
+                        use_container_width=True,
+                    )
+                except Exception:
+                    st.caption("ZIP作成に失敗しました。")
