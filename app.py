@@ -7,6 +7,16 @@ import base64
 from io import BytesIO
 from PIL import Image
 import re
+import os
+from dotenv import load_dotenv
+
+# .envファイルを読み込み
+load_dotenv()
+
+
+def get_api_key_from_env() -> str:
+    """環境変数からAPIキーを取得"""
+    return os.getenv("ANTHROPIC_API_KEY", "")
 
 
 def get_api_key_from_secrets() -> str:
@@ -18,12 +28,16 @@ def get_api_key_from_secrets() -> str:
 
 
 def get_stored_api_key() -> str:
-    """セッションまたはSecretsからAPIキーを取得"""
-    # まずSecretsをチェック（管理者設定）
+    """環境変数、Secrets、セッションの順でAPIキーを取得"""
+    # まず環境変数をチェック（.envファイル）
+    env_key = get_api_key_from_env()
+    if env_key:
+        return env_key
+    # 次にSecretsをチェック（Streamlit Cloud用）
     secrets_key = get_api_key_from_secrets()
     if secrets_key:
         return secrets_key
-    # 次にセッション状態をチェック（ユーザー入力）
+    # 最後にセッション状態をチェック（ユーザー入力）
     return st.session_state.get("user_api_key", "")
 
 
@@ -290,6 +304,131 @@ def get_all_pages_images(url: str, debug: bool = False) -> list[dict]:
     return all_images
 
 
+def get_next_episode_url(soup: BeautifulSoup, base_url: str, debug: bool = False) -> str | None:
+    """「次の話>>」のURLを取得"""
+    # <div class="page-text-body">次の話＞＞</div> を検出
+    next_episode_div = soup.find("div", class_="page-text-body", string=lambda t: t and "次の話" in t)
+
+    if next_episode_div:
+        # 親要素からリンクを探す
+        parent = next_episode_div.find_parent("a")
+        if parent and parent.get("href"):
+            next_url = urljoin(base_url, parent["href"])
+            if debug:
+                st.write(f"🔗 次の話を検出: {next_url}")
+            return next_url
+
+        # 兄弟要素や近くのリンクを探す
+        next_link = next_episode_div.find_next("a")
+        if next_link and next_link.get("href"):
+            next_url = urljoin(base_url, next_link["href"])
+            if debug:
+                st.write(f"🔗 次の話を検出: {next_url}")
+            return next_url
+
+    if debug:
+        st.write("ℹ️ 「次の話」リンクは見つかりませんでした")
+
+    return None
+
+
+def get_episode_images(url: str, episode_num: int = 1, debug: bool = False) -> tuple[list[dict], str | None]:
+    """1話分の画像を取得（ページネーションを含む）
+
+    Returns:
+        tuple: (画像リスト, 次の話のURL or None)
+    """
+    # 最初のページを取得
+    first_page_images, soup = get_page_images(url, debug)
+
+    if not soup:
+        return [], None
+
+    # 「次の話」のURLを取得
+    next_episode_url = get_next_episode_url(soup, url, debug)
+
+    # ページネーションを検出
+    page_urls = get_pagination_urls(url, soup, debug)
+
+    all_images = []
+    seen_urls = set()
+
+    if debug:
+        st.write(f"📖 第{episode_num}話の取得開始")
+
+    # 最初のページの画像を追加
+    for img in first_page_images:
+        if img["url"] not in seen_urls:
+            img["page"] = 1
+            img["episode"] = episode_num
+            all_images.append(img)
+            seen_urls.add(img["url"])
+
+    # 追加のページがある場合
+    if len(page_urls) > 1:
+        for i, page_url in enumerate(page_urls[1:], start=2):
+            if debug:
+                st.write(f"  ページ {i} を取得中: {page_url}")
+
+            page_images, page_soup = get_page_images(page_url, debug)
+
+            for img in page_images:
+                if img["url"] not in seen_urls:
+                    img["page"] = i
+                    img["episode"] = episode_num
+                    all_images.append(img)
+                    seen_urls.add(img["url"])
+
+            # 各ページでも「次の話」リンクを確認（最後のページで見つかることがある）
+            if page_soup and not next_episode_url:
+                next_episode_url = get_next_episode_url(page_soup, page_url, debug)
+
+    if debug:
+        st.write(f"📖 第{episode_num}話: {len(all_images)}枚の画像を取得")
+
+    return all_images, next_episode_url
+
+
+def get_multiple_episodes_images(url: str, num_episodes: int, debug: bool = False) -> list[dict]:
+    """複数話の画像を取得
+
+    Args:
+        url: 開始話のURL
+        num_episodes: 取得する話数
+        debug: デバッグモード
+
+    Returns:
+        list: 全話の画像リスト
+    """
+    all_images = []
+    current_url = url
+
+    for episode in range(1, num_episodes + 1):
+        if not current_url:
+            if debug:
+                st.write(f"⚠️ 第{episode}話のURLがありません。取得を終了します。")
+            break
+
+        if debug:
+            st.write(f"📚 第{episode}話を取得中: {current_url}")
+
+        episode_images, next_url = get_episode_images(current_url, episode_num=episode, debug=debug)
+        all_images.extend(episode_images)
+
+        # 次の話へ
+        current_url = next_url
+
+        if not next_url and episode < num_episodes:
+            if debug:
+                st.write(f"ℹ️ 第{episode}話が最終話です。{episode}話分を取得しました。")
+            break
+
+    if debug:
+        st.write(f"✅ 合計 {len(all_images)}枚の画像を取得（{min(episode, num_episodes)}話分）")
+
+    return all_images
+
+
 def download_image(url: str, referer: str = "") -> bytes | None:
     """画像をダウンロード"""
     headers = {
@@ -357,23 +496,35 @@ def filter_manga_images(images: list[dict], min_size: int = 50000, referer: str 
     return manga_images
 
 
-def analyze_images_batch(images: list[dict], api_key: str) -> str:
-    """複数の画像をまとめて解析してあらすじを抽出"""
+def encode_image_to_base64(img_info: dict) -> tuple[str, str]:
+    """画像をbase64エンコード"""
+    img = Image.open(BytesIO(img_info["data"]))
+    format_map = {
+        "JPEG": "image/jpeg",
+        "PNG": "image/png",
+        "GIF": "image/gif",
+        "WEBP": "image/webp"
+    }
+    media_type = format_map.get(img.format, "image/jpeg")
+    base64_image = base64.standard_b64encode(img_info["data"]).decode("utf-8")
+    return base64_image, media_type
+
+
+def extract_panel_details(images: list[dict], api_key: str, title: str = "") -> str:
+    """Step1: 各画像のセリフ・状況を詳細に抽出"""
     client = anthropic.Anthropic(api_key=api_key)
 
-    # 画像をbase64エンコードしてコンテンツを作成
     content = []
 
+    # タイトルがある場合は参考情報として先に追加
+    if title:
+        content.append({
+            "type": "text",
+            "text": f"【参考：記事タイトル】\n{title}\n\n"
+        })
+
     for i, img_info in enumerate(images):
-        img = Image.open(BytesIO(img_info["data"]))
-        format_map = {
-            "JPEG": "image/jpeg",
-            "PNG": "image/png",
-            "GIF": "image/gif",
-            "WEBP": "image/webp"
-        }
-        media_type = format_map.get(img.format, "image/jpeg")
-        base64_image = base64.standard_b64encode(img_info["data"]).decode("utf-8")
+        base64_image, media_type = encode_image_to_base64(img_info)
 
         content.append({
             "type": "text",
@@ -388,39 +539,90 @@ def analyze_images_batch(images: list[dict], api_key: str) -> str:
             },
         })
 
-    # プロンプトを追加
     content.append({
         "type": "text",
-        "text": """上記の漫画画像を順番に見て、このマンガのあらすじを抽出してください。
+        "text": """各画像について、以下の情報を正確に抽出してください。
 
-以下の形式で簡潔にまとめてください：
+【重要】
+- 吹き出し内のセリフは一字一句正確に書き起こしてください
+- 誰が誰に話しているか明確にしてください
+- 登場人物の呼び方（「お義母さん」「ママ」「お母さん」等）に注目し、関係性を判断してください
+- キャラクターの外見の特徴（年齢層、髪型、服装）を記録してください
 
-## あらすじ
-（ストーリーの流れを3〜5文で説明）
+各画像について以下の形式で出力：
 
-## 登場人物
-（主要キャラクターを箇条書きで）
-
-## ポイント
-（この漫画の見どころや教訓を1〜2文で）
-
-日本語で回答してください。セリフがある場合は、重要なセリフも含めてください。"""
+### 画像X
+- **セリフ**: （吹き出し内のセリフを全て書き起こし。誰の発言か明記）
+- **状況**: （何が起きているか）
+- **登場人物**: （この画像に登場する人物と特徴）
+- **感情/表情**: （キャラクターの感情状態）"""
     })
 
     try:
         message = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2048,
-            messages=[
-                {
-                    "role": "user",
-                    "content": content,
-                }
-            ],
+            model="claude-opus-4-5-20251101",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": content}],
         )
         return message.content[0].text
     except Exception as e:
-        return f"解析エラー: {str(e)}"
+        return f"抽出エラー: {str(e)}"
+
+
+def summarize_story(panel_details: str, api_key: str, title: str = "") -> str:
+    """Step2: 抽出した情報からストーリーをまとめる"""
+    client = anthropic.Anthropic(api_key=api_key)
+
+    prompt = f"""以下は漫画の各コマから抽出したセリフと状況の詳細です。
+これを元に、ストーリーを正確にまとめてください。
+
+"""
+    if title:
+        prompt += f"【記事タイトル】\n{title}\n\n"
+
+    prompt += f"""【抽出された詳細情報】
+{panel_details}
+
+---
+
+上記の情報を元に、以下の形式でまとめてください：
+
+## あらすじ
+（ストーリーの流れを3〜5文で説明。セリフの内容を反映し、登場人物の関係性を明確に記載）
+
+## 登場人物
+（主要キャラクターを箇条書きで。関係性も明記。例：「義母（主人公の夫の母）」）
+
+## ポイント
+（この漫画の見どころや教訓を1〜2文で）
+
+## 主要なセリフ
+（ストーリーを理解する上で重要なセリフを2〜3個引用）"""
+
+    try:
+        message = client.messages.create(
+            model="claude-opus-4-5-20251101",
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return message.content[0].text
+    except Exception as e:
+        return f"要約エラー: {str(e)}"
+
+
+def analyze_images_batch(images: list[dict], api_key: str, title: str = "") -> str:
+    """2段階解析: セリフ抽出→ストーリーまとめ"""
+
+    # Step 1: 各画像のセリフ・状況を詳細に抽出
+    panel_details = extract_panel_details(images, api_key, title)
+
+    if panel_details.startswith("抽出エラー"):
+        return panel_details
+
+    # Step 2: 抽出した情報からストーリーをまとめる
+    summary = summarize_story(panel_details, api_key, title)
+
+    return summary
 
 
 def check_title_consistency(title: str, summary: str, api_key: str) -> str:
@@ -458,7 +660,7 @@ def check_title_consistency(title: str, summary: str, api_key: str) -> str:
 
     try:
         message = client.messages.create(
-            model="claude-sonnet-4-20250514",
+            model="claude-opus-4-5-20251101",
             max_tokens=1024,
             messages=[
                 {"role": "user", "content": prompt}
@@ -473,12 +675,17 @@ def check_title_consistency(title: str, summary: str, api_key: str) -> str:
 with st.sidebar:
     st.header("⚙️ 設定")
 
-    # SecretsにAPIキーがあるかチェック
+    # APIキーの取得元を確認
+    env_key = get_api_key_from_env()
     secrets_key = get_api_key_from_secrets()
 
-    if secrets_key:
+    if env_key:
+        # .envに設定済みの場合
+        st.success("APIキー設定済み（.env）")
+        api_key = env_key
+    elif secrets_key:
         # Secretsに設定済みの場合
-        st.success("APIキー設定済み（管理者）")
+        st.success("APIキー設定済み（Secrets）")
         api_key = secrets_key
     else:
         # ユーザー入力モード
@@ -517,20 +724,46 @@ with st.sidebar:
         help="この値より小さい画像は除外されます"
     )
 
-    auto_pagination = st.checkbox(
-        "ページネーション自動検出",
-        value=True,
-        help="複数ページの記事を自動で検出して全ページの画像を取得"
-    )
-
     debug_mode = st.checkbox("デバッグモード", value=True, help="画像検出の詳細を表示")
 
 # メインコンテンツ
-url = st.text_input(
-    "🔗 解析するURLを入力",
-    placeholder="https://example.com/manga-article",
-    help="漫画画像が掲載されているページのURLを入力してください"
-)
+st.subheader("📖 漫画タイプを選択してURLを入力")
+
+manga_type_col1, manga_type_col2 = st.columns(2)
+
+with manga_type_col1:
+    st.markdown("**📚 連載漫画**（3話分読み込み）")
+    serial_url = st.text_input(
+        "連載漫画URL",
+        placeholder="https://example.com/serial-manga",
+        help="連載漫画のURLを入力（3話分の画像を読み込みます）",
+        label_visibility="collapsed"
+    )
+
+with manga_type_col2:
+    st.markdown("**📄 エピ漫画**（1話分読み込み）")
+    episode_url = st.text_input(
+        "エピ漫画URL",
+        placeholder="https://example.com/episode-manga",
+        help="エピソード漫画のURLを入力（1話分の画像を読み込みます）",
+        label_visibility="collapsed"
+    )
+
+# どちらのURLが入力されたか判定
+url = ""
+num_episodes = 1
+manga_type_label = ""
+
+if serial_url and episode_url:
+    st.warning("⚠️ どちらか一方のURLのみ入力してください")
+elif serial_url:
+    url = serial_url
+    num_episodes = 3
+    manga_type_label = "連載漫画"
+elif episode_url:
+    url = episode_url
+    num_episodes = 1
+    manga_type_label = "エピ漫画"
 
 article_title = st.text_input(
     "📰 記事タイトル（任意）",
@@ -544,15 +777,17 @@ with col1:
 
 if analyze_button:
     if not url:
-        st.error("URLを入力してください")
+        st.error("URLを入力してください（連載漫画またはエピ漫画のどちらか）")
+    elif serial_url and episode_url:
+        st.error("どちらか一方のURLのみ入力してください")
     elif not api_key:
         st.error("APIキーを設定してください")
     else:
+        st.info(f"📖 **{manga_type_label}**として解析します（{num_episodes}話分）")
+
         with st.spinner("ページから画像を取得中..."):
-            if auto_pagination:
-                images = get_all_pages_images(url, debug=debug_mode)
-            else:
-                images, _ = get_page_images(url, debug=debug_mode)
+            # 新しいロジック: 話数単位で取得
+            images = get_multiple_episodes_images(url, num_episodes=num_episodes, debug=debug_mode)
 
         if not images:
             st.warning("画像が見つかりませんでした。デバッグモードをONにして詳細を確認してください。")
@@ -575,12 +810,19 @@ if analyze_button:
                     for img in images:
                         st.text(img["url"])
             else:
-                st.success(f"📚 {len(manga_images)}件の漫画画像を検出しました")
+                # 話数ごとの画像数を集計
+                episode_counts = {}
+                for img in manga_images:
+                    ep = img.get("episode", 1)
+                    episode_counts[ep] = episode_counts.get(ep, 0) + 1
+
+                episode_summary = "、".join([f"第{ep}話: {count}枚" for ep, count in sorted(episode_counts.items())])
+                st.success(f"📚 {len(manga_images)}件の漫画画像を検出しました（{episode_summary}）")
 
                 # 画像を表示
                 st.header("🖼️ 検出された漫画画像")
 
-                # グリッド表示
+                # グリッド表示（話数ごとにグループ化）
                 cols_per_row = 3
                 for i in range(0, len(manga_images), cols_per_row):
                     cols = st.columns(cols_per_row)
@@ -590,9 +832,10 @@ if analyze_button:
                             img_info = manga_images[idx]
                             with col:
                                 page_num = img_info.get("page", 1)
+                                episode_num = img_info.get("episode", 1)
                                 st.image(
                                     img_info["data"],
-                                    caption=f"画像 {idx+1} (P{page_num})",
+                                    caption=f"第{episode_num}話 P{page_num}",
                                     use_container_width=True
                                 )
 
@@ -601,7 +844,7 @@ if analyze_button:
                 st.header("📝 あらすじ解析")
 
                 with st.spinner("AIがあらすじを解析中..."):
-                    summary = analyze_images_batch(manga_images, api_key)
+                    summary = analyze_images_batch(manga_images, api_key, title=article_title)
 
                 st.markdown(summary)
 
